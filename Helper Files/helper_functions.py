@@ -12,9 +12,8 @@ https://koremarcel.com
 
 import pandas as pd
 from datetime import datetime
-
-
-
+from yellowbrick.model_selection import LearningCurve
+from sklearn.model_selection import StratifiedKFold
 import itertools
 
 # Viz Libraries
@@ -22,10 +21,18 @@ import seaborn as sns
 sns.set(style='darkgrid', palette="deep", font_scale=1.1, rc={"figure.figsize": [8, 5]})
 import warnings
 import matplotlib.gridspec as gs
+
+from yellowbrick.model_selection import ValidationCurve
+import matplotlib as mpl
+from cycler import cycler
+
+
 import matplotlib.style as style
 import matplotlib.pyplot as plt
+import boruta_py as bpy
 from matplotlib.ticker import FuncFormatter
 import scikitplot as skplt
+
 
 style.use('fivethirtyeight')
 # %matplotlib inline
@@ -39,11 +46,14 @@ from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.model_selection import KFold
 import numpy as np
 from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix
+from sklearn.metrics import roc_curve
 
 # sklearn libraries
 from sklearn.impute import SimpleImputer
 
 from sklearn.linear_model import LogisticRegression
+from mlxtend.plotting import plot_sequential_feature_selection as plot_sfs
+from mlxtend.feature_selection import SequentialFeatureSelector as sfs
 
 # Model Interpretation
 import eli5
@@ -56,7 +66,12 @@ import category_encoders as ce
 from sklearn.ensemble import RandomForestClassifier
 
 # feature selection
-from sklearn.feature_selection import RFECV
+#from sklearn.feature_selection import RFECV
+from sklearn.model_selection import learning_curve
+
+from sklearn.ensemble import IsolationForest
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 
 # Function to time how long  jobs run
@@ -69,6 +84,52 @@ def timer(start_time=None):
         thour, temp_sec = divmod((datetime.now() - start_time).total_seconds(), 3600)
         tmin, tsec = divmod(temp_sec, 60)
         print('\n Time taken: %i hours %i minutes and %s seconds.' % (thour, tmin, round(tsec, 2)))
+
+
+def define_optimal_threshold(model,X_test,y_test,plot=True):
+    """
+    
+    credit: https://www.kaggle.com/deepanshu08/prediction-of-lendingclub-loan-defaulters
+    """
+    
+    fp, tp, threshold = roc_curve(y_test, model.predict_proba(X_test)[:,1])
+    
+    if plot==True:
+        
+        fig, ax = plt.subplots(nrows=1, ncols=2, figsize=(16,6));
+
+        ax[0].plot(threshold, tp + (1 - fp));
+        ax[0].set_xlabel('Threshold');
+        ax[0].set_ylabel('Sensitivity + Specificity');
+
+        ax[1].plot(threshold, tp, label="tp");
+        ax[1].plot(threshold, 1 - fp, label="1 - fp");
+        ax[1].legend();
+        ax[1].set_xlabel('Threshold');
+        ax[1].set_ylabel('True Positive & False Positive Rates');
+
+
+    # finding the optimal threshold for the model
+    function = tp + (1 - fp)
+    index = np.argmax(function)
+
+    optimal_threshold = round((threshold[np.argmax(function)]),2)
+    print("optimal threshold:{}".format(optimal_threshold))
+    
+    return optimal_threshold
+        
+
+def plot_predicted_probabilities(probabilities):
+    """
+    
+    """
+    plt.rcParams['font.size'] = 14
+    plt.rcParams["figure.figsize"] = [7,7]
+    plt.hist(probabilities)
+    plt.xlim(0, 1)
+    plt.title('Histogram of predicted probabilities')
+    plt.xlabel('Predicted probability')
+    plt.ylabel('Frequency')
 
 
 def dist_comparison(missing_values_dataframe, non_missing_values_dataframe):
@@ -122,7 +183,7 @@ def dist_comparison(missing_values_dataframe, non_missing_values_dataframe):
     return None
 
 
-def encode_categorical_features(dataframe, strategy, list_of_features, list_of_features_to_skip=None):
+def encode_categorical_features(dataframe, strategy, list_of_features,list_of_features_to_skip=None):
     """
     This function will take a dataframe as input and perform the following:
 
@@ -152,6 +213,8 @@ def encode_categorical_features(dataframe, strategy, list_of_features, list_of_f
     if not isinstance(list_of_features, list):
         raise ValueError("Object passed is not a dataframe")
 
+    encoder_type = "james_stein"
+
     # split dataframe into features and target variable
     y = dataframe['loan_status']
     x = dataframe.drop("loan_status", axis=1)
@@ -174,10 +237,6 @@ def encode_categorical_features(dataframe, strategy, list_of_features, list_of_f
         non_ordinal = dataframe.select_dtypes(include='category').columns.tolist()
         # filter out non-ordinal features using ordinal features passed
         non_ordinal_features = [value for value in non_ordinal if value not in list_of_features]
-
-        # remove our target variable
-        # *refactor this to pass it as a parameter*
-        non_ordinal_features.remove('loan_status')
 
         # create encoder object
         encoder = ce.JamesSteinEncoder(cols=non_ordinal_features)
@@ -243,7 +302,226 @@ def rfecv_feature_selection(x_train, y_train, scoring, n_jobs, cross_val,cross_v
     return x
 
 
-def feature_selection(x_train, y_train, scoring, n_jobs, cross_val, classifier='rfc', top_n_features= 8,):
+def hybrid_feature_selection(dataframe, target_feature_name, scoring_metric, n_jobs, cross_val, range_of_features):
+    """
+    This function will take a dataframe as input and perform the following:
+
+    a) Remove noise using Boruta Feature Selection
+    b) Select the top features given a range of features to select
+
+    :param dataframe: dataframe with features to select from
+    :param target_feature_name: target name of the feature
+    :param scoring_metric: f1_weighted, accuracy, roc_auc etc.
+    :param cross_val: # of cross validation folds
+    :param n_jobs: # of cpu jobs
+    :param range_of_features: tuple of the range of features to select from (low, high)
+    :return: dataframe with features reduced
+    """
+
+    if not isinstance(dataframe, pd.DataFrame):
+        raise ValueError("Object passed is not a dataframe")
+
+    if not isinstance(range_of_features, tuple):
+        raise ValueError("range_of_features passed is not a tuple")
+
+    classifier = RandomForestClassifier(n_jobs=n_jobs, class_weight="balanced", max_depth=6, random_state=2019)
+
+    x_temp = dataframe.drop(target_feature_name, axis=1)
+    column_names = x_temp.columns
+    y_temp = dataframe[target_feature_name]
+
+    x = dataframe.drop(target_feature_name, axis=1).values
+    y = dataframe[target_feature_name].values.ravel()
+
+    """
+    Boruta Py Code - credit: https://www.kaggle.com/rsmits/feature-selection-with-boruta
+    """
+    
+    feat_selector = bpy.BorutaPy(classifier, n_estimators='auto', verbose=False, random_state=1)
+
+    feat_selector.fit(x, y)
+
+    filtered_dataframe = feat_selector.transform(x)
+
+    final_features = list()
+
+    indexes = np.where(feat_selector.support_ == True)
+
+    for x in np.nditer(indexes):
+        final_features.append(column_names[x])
+
+    boruta_dataframe = x_temp[final_features]
+
+    # merge back the target variable to the dataframe(df)
+    df = boruta_dataframe.merge(y_temp, on=y_temp.index)
+
+    # drop generated index
+    df.drop("key_0", axis=1, inplace=True)
+
+    # Sequential Feature Selection - Select top features given a range
+
+    x = dataframe.drop(target_feature_name, axis=1)
+    # save our target feature in a y variable
+    y = dataframe[target_feature_name]
+
+    # forward selection
+
+    sequential_forward_feature_selection = sfs(classifier,
+                                               k_features=range_of_features,
+                                               forward=True,
+                                               n_jobs=n_jobs,
+                                               floating=False,
+                                               verbose=False,
+                                               scoring=scoring_metric,
+                                               cv=cross_val)
+
+    sfs_algo = sequential_forward_feature_selection.fit(x, y)
+
+    sfs_cross_val_score = sfs_algo.k_score_
+
+    cross_val = round(sfs_cross_val_score, 2)
+
+    selected_features = list(sfs_algo.k_feature_names_)
+
+    print("Number of features selected is:  {}".format(len(sfs_algo.k_feature_names_)))
+
+    print("Cross Validation Score for {}, is {}".format(scoring_metric, cross_val))
+
+    plot_sfs(sfs_algo.get_metric_dict(), kind='std_err', figsize=(11, 7));
+
+    df = x[selected_features]
+
+    # merge back the target variable to the dataframe(df)
+    df = df.merge(y, on=y.index)
+
+    # drop generated index
+    df.drop("key_0", axis=1, inplace=True)
+
+    cat_features = []
+
+    for col_name in df.columns:
+        if df[col_name].dtype != 'float64':
+            if col_name != 'loan_status':
+                cat_features.append(col_name)
+
+    print("Categorical Features: {}".format(cat_features))
+
+    return df
+
+
+def feature_selection_mlextend(dataframe, target_feature_name, scoring_metric, n_jobs, cross_val, range_of_features):
+    """
+    This function will take a dataframe as input and perform the following:
+
+    a) Remove noise using Boruta Feature Selection
+    b) Select the top features given a range of features to select
+
+    :param dataframe: dataframe with features to select from
+    :param target_feature_name: target name of the feature
+    :param scoring_metric: f1_weighted, accuracy, roc_auc etc.
+    :param cross_val: # of cross validation folds
+    :param n_jobs: # of cpu jobs
+    :param range_of_features: tuple of the range of features to select from (low, high)
+    :return: dataframe with features reduced
+    """
+
+    if not isinstance(dataframe, pd.DataFrame):
+        raise ValueError("Object passed is not a dataframe")
+
+    if not isinstance(range_of_features, tuple):
+        raise ValueError("range_of_features passed is not a tuple")
+
+    classifier = RandomForestClassifier(n_jobs=n_jobs, class_weight="balanced", max_depth=6, random_state=2019)
+
+    x = dataframe.drop(target_feature_name, axis=1).values
+    y = dataframe[target_feature_name].values.ravel()
+
+    # forward selection
+
+    sequential_forward_feature_selection = sfs(classifier,
+                                               k_features=range_of_features,
+                                               forward=True,
+                                               n_jobs=n_jobs,
+                                               floating=False,
+                                               verbose=False,
+                                               scoring=scoring_metric,
+                                               cv=cross_val)
+
+    sfs_algo = sequential_forward_feature_selection.fit(x, y)
+
+    sfs_cross_val_score = sfs_algo.k_score_
+
+    cross_val = round(sfs_cross_val_score, 2)
+
+    selected_features = list(sfs_algo.k_feature_names_)
+
+    print("Number of features selected is:  {}".format(len(sfs_algo.k_feature_names_)))
+
+    print("Cross Validation Score for {}, is {}".format(scoring_metric, cross_val))
+
+    plot_sfs(sfs_algo.get_metric_dict(), kind='std_err', figsize=(11, 7));
+
+    df = x[selected_features]
+
+    # merge back the target variable to the dataframe(df)
+    df = df.merge(y, on=y.index)
+
+    # drop generated index
+    df.drop("key_0", axis=1, inplace=True)
+
+    cat_features = []
+
+    for col_name in df.columns:
+        if df[col_name].dtype != 'float64':
+            if col_name != 'loan_status':
+                cat_features.append(col_name)
+
+    print(cat_features)
+
+    return df
+
+
+def reduce_mem_usage(df):
+    """ iterate through all the columns of a dataframe and modify the data type
+        to reduce memory usage.     
+        https://www.kaggle.com/mlisovyi/lightgbm-hyperparameter-optimisation-lb-0-761
+    """
+    start_mem = df.memory_usage().sum() / 1024**2
+    print('Memory usage of dataframe is {:.2f} MB'.format(start_mem))
+    
+    for col in df.columns:
+        col_type = df[col].dtype
+        
+        if col_type != object:
+            c_min = df[col].min()
+            c_max = df[col].max()
+            if str(col_type)[:3] == 'int':
+                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                    df[col] = df[col].astype(np.int8)
+                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+                elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                    df[col] = df[col].astype(np.int64)  
+            else:
+                if c_min > np.finfo(np.float16).min and c_max < np.finfo(np.float16).max:
+                    df[col] = df[col].astype(np.float16)
+                elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                    df[col] = df[col].astype(np.float32)
+                else:
+                    df[col] = df[col].astype(np.float64)
+        else:
+            df[col] = df[col].astype('category')
+
+    end_mem = df.memory_usage().sum() / 1024**2
+    print('Memory usage after optimization is: {:.2f} MB'.format(end_mem))
+    print('Decreased by {:.1f}%'.format(100 * (start_mem - end_mem) / start_mem))
+    
+    return df
+
+
+def feature_selection(x_train, y_train, scoring, n_jobs, cross_val, classifier='rfc'):
     """
     This function will take a dataframe as input and perform the following:
 
@@ -260,6 +538,8 @@ def feature_selection(x_train, y_train, scoring, n_jobs, cross_val, classifier='
     :param classifier: Optional parameter to select classifier to use
     :return: dataframe with outliers removed.
     """
+    
+    from yellowbrick.model_selection import RFECV
 
     if not isinstance(x_train, pd.DataFrame):
         raise ValueError("Object passed is not a dataframe")
@@ -274,13 +554,15 @@ def feature_selection(x_train, y_train, scoring, n_jobs, cross_val, classifier='
     else:
         classifier = LogisticRegression(class_weight='balanced', n_jobs=-1, solver='lbfgs')
 
-    rfecv_selector = RFECV(estimator=classifier, step=1, cv=cross_val, scoring=scoring, n_jobs=n_jobs)
+    rfecv_selector = RFECV(model=classifier, step=1, cv=cross_val, scoring=scoring, n_jobs=n_jobs)
 
     rfecv_selector.fit(x, y)
 
     print('Optimal number of features : %d' % rfecv_selector.n_features_)
     # print("RFE selected the {} # of features to be :".format(rfecv_selector.n_features_))
-
+    
+    rfecv_selector.show()
+    
     # grab selected features
     top_n_features = feature_names[rfecv_selector.support_].tolist()
 
@@ -289,50 +571,40 @@ def feature_selection(x_train, y_train, scoring, n_jobs, cross_val, classifier='
     return x
 
 
-def remove_outliers(dataframe, contamination=0.2):
+def remove_outliers(df, cpu_count, contamination='auto',):
+    
     """
     This function will take a dataframe as input and perform the following:
 
-    Remove outliers using the EllipticEnvelope sklearn library.
-    https://scikit-learn.org/stable/modules/generated/sklearn.covariance.EllipticEnvelope.html
-
-    :param dataframe: dataframe object
+    :param df: dataframe object
     :param  contamination: The amount of contamination of the data set,
             i.e. the proportion of outliers in the data set.
     :return: dataframe with outliers removed.
     """
 
-    if not isinstance(dataframe, pd.DataFrame):
-        raise ValueError("Object passed is not a dataframe")
+    #if not isinstance(df, pd.DataFrame):
+    #    raise ValueError("Object passed is not a dataframe")
 
-    # call the Elliptic Envelope function
-    ee = EllipticEnvelope(contamination=contamination)
+    iso_forest_pipe = Pipeline([
+        ('scale', StandardScaler()),
+        ('isolation_forest', IsolationForest(n_jobs=cpu_count, contamination=contamination))
+        ])
 
-    # fit the function to the dataframe passed
-    ee.fit(dataframe)
+    iso_forest_pipe.fit(df)
 
-    # predict outliers vs in-liers
-    detection = ee.predict(dataframe)
+    outlier_predictions = iso_forest_pipe.predict(df)
 
-    # grab outliers
-    outliers = np.where(detection == -1)
+    df['outliers'] = outlier_predictions
 
-    # add outliers to the dataframe
-    dataframe['outliers'] = detection
-
-    # store the number of outliers removed
-    outliers = dataframe.loc[dataframe['outliers'] == -1].shape
-    non_outliers = dataframe.loc[dataframe['outliers'] == 1].shape
-
-    # drop the outliers from the dataset
-    dataframe = dataframe[dataframe['outliers'] != -1]
-
-    # Drop the outliers column
-    dataframe.drop('outliers', axis=1, inplace=True)
+    outliers = df.loc[df['outliers'] == -1].shape
 
     print("The number of outliers in the dataframe passed : {}".format(outliers))
 
-    return dataframe
+    df = df[df['outliers'] != -1]
+
+    df.drop('outliers', axis=1, inplace=True)
+
+    return df
 
 
 def impute_features(dataframe, strategy):
@@ -567,10 +839,16 @@ def encode_target_feature(dataframe):
         raise ValueError(" Object passed is not a dataframe")
 
     # map loan status values to 1, 2 and 0
-    dataframe['loan_status'] = dataframe['loan_status'].map({'Current': 2, 'Fully Paid': 1, 'Charged Off': 0,
+    dataframe['loan_status'] = dataframe['loan_status'].map({'Current': 2,
+                                                             'Fully Paid': 1,
+                                                             'Charged Off': 0,
                                                              'Late(31-120 days)': 0,
                                                              'In Grace Period': 0,
-                                                             'Late(16-30 days)': 0, 'Default': 0})
+                                                             'Late(16-30 days)': 0,
+                                                             'Does not meet the credit policy. Status:Fully Paid':0,
+                                                             'Does not meet the credit policy. Status:Charged Off':0, 
+                                                             'Default': 0}
+                                                           )
     # we want to exclude current records as those are ongoing and haven't arrived to their final state
     dataframe = dataframe[dataframe.loan_status != 2]
     # apply a function to select only charged off and fully paid examples
@@ -598,10 +876,6 @@ def convert_data_type(dataframe):
     for value in dataframe:
         if dataframe[value].dtype == 'object':
             dataframe[value] = dataframe[value].astype('category')
-
-    for value in dataframe:
-        if dataframe[value].dtype == 'float64':
-            dataframe[value] = dataframe[value].astype('float32')
 
     return dataframe
 
@@ -648,3 +922,168 @@ def data_dictionary(data=None):
     dictionary_df = pd.DataFrame(dd.loc[dd["feature"].isin(data)]). \
         drop_duplicates().sort_values("feature", ascending=True)
     return dictionary_df
+
+
+def yellow_brick_learning_curve(model, x, y, cpu_count, cv_count, scoring_metric):
+    """
+
+    """
+    # Create the learning curve visualizer
+    cv = StratifiedKFold(n_splits=cv_count)
+    sizes = np.linspace(0.3, 1.0, 10)
+
+    # Instantiate the classification model and visualizer
+    visualizer = LearningCurve(
+        model, cv=cv, scoring=scoring_metric, train_sizes=sizes, n_jobs=cpu_count)
+
+    visualizer.fit(x, y)  # Fit the data to the visualizer
+    visualizer.show()  # Finalize and render the figure
+
+
+def yellow_brick_validation_curve(model, x, y, cpu_count, cv_count, param, scoring_metric):
+    """
+
+    """
+    from yellowbrick.model_selection import LearningCurve
+    from sklearn.model_selection import StratifiedKFold
+
+    # Create the learning curve visualizer
+    cv = StratifiedKFold(n_splits=cv_count)
+    # Validation Curve
+
+    mpl.rcParams['axes.prop_cycle'] = cycler('color', ['purple', 'darkblue'])
+
+    fig = plt.gcf()
+    fig.set_size_inches(10, 10)
+    ax = plt.subplot(411)
+
+    viz = ValidationCurve(model,
+                          n_jobs=cpu_count,
+                          ax=ax,
+                          param_name=param,
+                          param_range=np.arange(1, 11),
+                          cv=cv,
+                          scoring=scoring_metric)
+
+    # Fit and poof the visualizer
+    viz.fit(x, y)
+    viz.show();
+
+
+def plot_learning_curve(estimator, title, X, y, axes=None, ylim=None, cv=None,
+                        n_jobs=None, train_sizes=np.linspace(.1, 1.0, 5)):
+    """
+    
+    https://scikit-learn.org/stable/auto_examples/model_selection/plot_learning_curve.html
+    
+    Generate 3 plots: the test and training learning curve, the training
+    samples vs fit times curve, the fit times vs score curve.
+
+    Parameters
+    ----------
+    estimator : object type that implements the "fit" and "predict" methods
+        An object of that type which is cloned for each validation.
+
+    title : string
+        Title for the chart.
+
+    X : array-like, shape (n_samples, n_features)
+        Training vector, where n_samples is the number of samples and
+        n_features is the number of features.
+
+    y : array-like, shape (n_samples) or (n_samples, n_features), optional
+        Target relative to X for classification or regression;
+        None for unsupervised learning.
+
+    axes : array of 3 axes, optional (default=None)
+        Axes to use for plotting the curves.
+
+    ylim : tuple, shape (ymin, ymax), optional
+        Defines minimum and maximum yvalues plotted.
+
+    cv : int, cross-validation generator or an iterable, optional
+        Determines the cross-validation splitting strategy.
+        Possible inputs for cv are:
+          - None, to use the default 5-fold cross-validation,
+          - integer, to specify the number of folds.
+          - :term:`CV splitter`,
+          - An iterable yielding (train, test) splits as arrays of indices.
+
+        For integer/None inputs, if ``y`` is binary or multiclass,
+        :class:`StratifiedKFold` used. If the estimator is not a classifier
+        or if ``y`` is neither binary nor multiclass, :class:`KFold` is used.
+
+        Refer :ref:`User Guide <cross_validation>` for the various
+        cross-validators that can be used here.
+
+    n_jobs : int or None, optional (default=None)
+        Number of jobs to run in parallel.
+        ``None`` means 1 unless in a :obj:`joblib.parallel_backend` context.
+        ``-1`` means using all processors. See :term:`Glossary <n_jobs>`
+        for more details.
+
+    train_sizes : array-like, shape (n_ticks,), dtype float or int
+        Relative or absolute numbers of training examples that will be used to
+        generate the learning curve. If the dtype is float, it is regarded as a
+        fraction of the maximum size of the training set (that is determined
+        by the selected validation method), i.e. it has to be within (0, 1].
+        Otherwise it is interpreted as absolute sizes of the training sets.
+        Note that for classification the number of samples usually have to
+        be big enough to contain at least one sample from each class.
+        (default: np.linspace(0.1, 1.0, 5))
+    """
+    if axes is None:
+        _, axes = plt.subplots(1, 3, figsize=(20, 5))
+
+    axes[0].set_title(title)
+    if ylim is not None:
+        axes[0].set_ylim(*ylim)
+    axes[0].set_xlabel("Training examples")
+    axes[0].set_ylabel("Score")
+
+    train_sizes, train_scores, test_scores, fit_times, _ = \
+        learning_curve(estimator, X, y, cv=cv, n_jobs=n_jobs,
+                       train_sizes=train_sizes,
+                       return_times=True)
+    train_scores_mean = np.mean(train_scores, axis=1)
+    train_scores_std = np.std(train_scores, axis=1)
+    test_scores_mean = np.mean(test_scores, axis=1)
+    test_scores_std = np.std(test_scores, axis=1)
+    fit_times_mean = np.mean(fit_times, axis=1)
+    fit_times_std = np.std(fit_times, axis=1)
+
+    # Plot learning curve
+    axes[0].grid()
+    axes[0].fill_between(train_sizes, train_scores_mean - train_scores_std,
+                         train_scores_mean + train_scores_std, alpha=0.1,
+                         color="r")
+    axes[0].fill_between(train_sizes, test_scores_mean - test_scores_std,
+                         test_scores_mean + test_scores_std, alpha=0.1,
+                         color="g")
+    axes[0].plot(train_sizes, train_scores_mean, 'o-', color="r",
+                 label="Training score")
+    axes[0].plot(train_sizes, test_scores_mean, 'o-', color="g",
+                 label="Cross-validation score")
+    axes[0].legend(loc="best")
+
+    # Plot n_samples vs fit_times
+    axes[1].grid()
+    axes[1].plot(train_sizes, fit_times_mean, 'o-')
+    axes[1].fill_between(train_sizes, fit_times_mean - fit_times_std,
+                         fit_times_mean + fit_times_std, alpha=0.1)
+    axes[1].set_xlabel("Training examples")
+    axes[1].set_ylabel("fit_times")
+    axes[1].set_title("Scalability of the model")
+
+    # Plot fit_time vs score
+    axes[2].grid()
+    axes[2].plot(fit_times_mean, test_scores_mean, 'o-')
+    axes[2].fill_between(fit_times_mean, test_scores_mean - test_scores_std,
+                         test_scores_mean + test_scores_std, alpha=0.1)
+    axes[2].set_xlabel("fit_times")
+    axes[2].set_ylabel("Score")
+    axes[2].set_title("Performance of the model")
+  
+    return plt
+
+

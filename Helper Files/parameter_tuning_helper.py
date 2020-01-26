@@ -39,7 +39,8 @@ from eli5.sklearn import PermutationImportance
 import scikitplot as skplt
 from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix
 from sklearn.metrics import accuracy_score, recall_score, precision_score
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+
 from sklearn.model_selection import KFold
 import numpy as np
 from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix
@@ -75,8 +76,9 @@ def lgb_tuning(x_train, y_train, x_test, y_test,
                max_evals_num,
                device_type,
                categorical_features,
-               early_stopping_rounds=100,
-               class_weights='balanced'
+               max_depth,
+               early_stopping_rounds=30,
+               class_weights='balanced',
                ):
     """
 
@@ -118,8 +120,7 @@ def lgb_tuning(x_train, y_train, x_test, y_test,
 
         lgbm = lgb.LGBMClassifier(
             learning_rate=space['learning_rate'],
-            n_estimators=int(space['n_estimators']),
-            max_depth=int(space['max_depth']),
+            #max_depth=int(space['max_depth']),
             num_leaves=int(space['num_leaves']),
             colsample_bytree=space['colsample_bytree'],
             feature_fraction=space['feature_fraction'],
@@ -130,7 +131,8 @@ def lgb_tuning(x_train, y_train, x_test, y_test,
             n_jobs=cpu_count,
             device_type=device_type,
             objective='binary',
-            class_weight=class_weights
+            class_weight=class_weights,
+            max_depth=max_depth
         )
 
         lgbm.fit(x_train, y_train,
@@ -141,10 +143,12 @@ def lgb_tuning(x_train, y_train, x_test, y_test,
                  )
 
         # Applying k-Fold Cross Validation
+        strat_k_fold = StratifiedKFold(n_splits=cv_value)
+
         accuracies = cross_val_score(estimator=lgbm,
                                      X=x_train,
                                      y=y_train,
-                                     cv=cv_value,
+                                     cv=strat_k_fold,
                                      n_jobs=cpu_count,
                                      scoring=scoring)
 
@@ -164,8 +168,7 @@ def lgb_tuning(x_train, y_train, x_test, y_test,
 
     space = {
         'learning_rate': hp.loguniform('learning_rate', np.log(0.001), np.log(0.3)),
-        'n_estimators': hp.quniform('n_estimators', 50, 1200, 25),
-        'max_depth': hp.quniform('max_depth', 1, 15, 1),
+        # 'max_depth': hp.quniform('max_depth', 1, 15, 1),
         'num_leaves': hp.quniform('num_leaves', 10, 150, 1),
         'colsample_bytree': hp.uniform('colsample_bytree', 0.3, 1.0),
         'feature_fraction': hp.uniform('feature_fraction', .3, 1.0),
@@ -185,8 +188,7 @@ def lgb_tuning(x_train, y_train, x_test, y_test,
     # Fitting LightGBM to the Training set
     light_gbm = lgb.LGBMClassifier(
         learning_rate=round((lgb_hyperparams['learning_rate']), 3),
-        n_estimators=int(lgb_hyperparams['n_estimators']),
-        max_depth=int(lgb_hyperparams['max_depth']),
+        # max_depth=int(lgb_hyperparams['max_depth']),
         num_leaves=int(lgb_hyperparams['num_leaves']),
         colsample_bytree=lgb_hyperparams['colsample_bytree'],
         feature_fraction=lgb_hyperparams['feature_fraction'],
@@ -197,7 +199,8 @@ def lgb_tuning(x_train, y_train, x_test, y_test,
         categorical_list=lgb_hyperparams['categorical_list'],
         objective='binary',
         device_type=device_type,
-        class_weight=class_weights
+        class_weight=class_weights,
+        max_depth=max_depth
     )
 
     lgb_results = org_results(trials.trials, lgb_hyperparams, 'LightGBM')
@@ -301,30 +304,34 @@ def xgboost_parameter_tuning(x_train, y_train,
                              x_test, y_test,
                              cpu_count,
                              scoring,
-                             early_stopping_rounds,
                              cv_value,
                              scale_pos_weight,
-                             max_evals_num
+                             max_evals_num,
+                             xgboost_eval_metric='aucpr',
+                             early_stopping_rounds=100,
                              ):
 
     start_time = datetime.now()
+
+    strat_k_fold = StratifiedKFold(n_splits=cv_value)
   
     def objective(space):
-        xgb_clf = xgb.XGBClassifier(n_estimators=space['n_estimators'],
-                                    max_depth=int(space['max_depth']),
+        xgb_clf = xgb.XGBClassifier(max_depth=int(space['max_depth']),
                                     learning_rate=space['learning_rate'],
                                     gamma=space['gamma'],
                                     min_child_weight=space['min_child_weight'],
                                     subsample=space['subsample'],
                                     colsample_bytree=space['colsample_bytree'],
                                     n_jobs=cpu_count,
-                                    grow_policy = 'lossguide',
-                                    scale_pos_weight=scale_pos_weight
+                                    grow_policy='lossguide',
+                                    scale_pos_weight=scale_pos_weight,
+                                    n_estimators=10000
                                     )
 
         eval_set = [(x_test, y_test)]
         xgb_clf.fit(x_train, y_train,
                     eval_set=eval_set,
+                    eval_metric=xgboost_eval_metric,
                     verbose=False,
                     early_stopping_rounds=early_stopping_rounds)
 
@@ -332,7 +339,7 @@ def xgboost_parameter_tuning(x_train, y_train,
         accuracies = cross_val_score(estimator=xgb_clf,
                                      X=x_train,
                                      y=y_train,
-                                     cv=cv_value,
+                                     cv=strat_k_fold,
                                      n_jobs=cpu_count,
                                      scoring=scoring)
         
@@ -343,7 +350,6 @@ def xgboost_parameter_tuning(x_train, y_train,
     space = {
         'max_depth': hp.choice('max_depth', range(5, 30, 1)),
         'learning_rate': hp.quniform('learning_rate', 0.01, 0.5, 0.01),
-        'n_estimators': hp.choice('n_estimators', range(20, 205, 5)),
         'gamma': hp.quniform('gamma', 0, 0.50, 0.01),
         'min_child_weight': hp.quniform('min_child_weight', 1, 10, 1),
         'subsample': hp.quniform('subsample', 0.1, 1, 0.01),
@@ -358,7 +364,6 @@ def xgboost_parameter_tuning(x_train, y_train,
                 trials=trials)
 
     classifier = xgb.XGBClassifier(scale_pos_weight=scale_pos_weight,
-                                   n_estimators=best['n_estimators'],
                                    max_depth=best['max_depth'],
                                    learning_rate=best['learning_rate'],
                                    gamma=best['gamma'],
@@ -366,7 +371,8 @@ def xgboost_parameter_tuning(x_train, y_train,
                                    subsample=best['subsample'],
                                    colsample_bytree=best['colsample_bytree'],
                                    n_jobs=cpu_count,
-                                   grow_policy = 'lossguide'
+                                   grow_policy='lossguide',
+                                   n_estimators=10000
                                    )
 
     time_elapsed = datetime.now() - start_time
