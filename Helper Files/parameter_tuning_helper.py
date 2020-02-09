@@ -4,58 +4,22 @@
 """
 These are helper functions are specifically created for the loan dataset.
 
-They can be obviously modified for another type of dataset.
-
 https://koremarcel.com
 """
 ############################################################################
-
+from numpy.random import RandomState
 import pandas as pd
-# plot classification report
-from yellowbrick.classifier import ClassificationReport
-from datetime import datetime
-import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter
-import scikitplot as skplt
 import xgboost as xgb
 from sklearn.metrics import average_precision_score
-
-from catboost import Pool, CatBoostClassifier
-
-
-from yellowbrick.classifier import ROCAUC
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-
-# metrics
-from sklearn.metrics import accuracy_score, recall_score, precision_score
 from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.model_selection import KFold
-
-# Model Interpretation
-import eli5
-from eli5.sklearn import PermutationImportance
-
-# metrics
-import scikitplot as skplt
-from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix
-from sklearn.metrics import accuracy_score, recall_score, precision_score
-from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
-
-from sklearn.model_selection import KFold
 import numpy as np
-from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix
-
-
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
 
 # classification algorithms
 import lightgbm as lgb
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.svm import SVC
 from datetime import datetime
-from catboost import CatBoostClassifier, Pool, cv
 
 # hyper-parameter tuning
 from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
@@ -65,8 +29,6 @@ import catboost as cb
 import warnings
 warnings.filterwarnings('ignore')
 warnings.filterwarnings(action='ignore', category=DeprecationWarning)
-from sklearn.metrics import accuracy_score
-from numpy.random import RandomState
 
 
 def lgb_tuning(x_train, y_train, x_test, y_test,
@@ -76,13 +38,26 @@ def lgb_tuning(x_train, y_train, x_test, y_test,
                max_evals_num,
                device_type,
                categorical_features,
-               max_depth,
-               early_stopping_rounds=30,
-               class_weights='balanced',
+               early_stopping_rounds=100,
+               class_weights='balanced'
                ):
     """
 
+    This function tuning a LightGBM Classification model using the HyperOpt bayesian library.
 
+    :param x_train: training set  data
+    :param y_train: target variable
+    :param x_test: test test data
+    :param y_test: test set target variable
+    :param cpu_count: number of cpu cores to use
+    :param scoring: scoring metric to be used for the tuning
+    :param cv_value: number of cross validations to perform
+    :param max_evals_num: max evaluations for the hyperopt function
+    :param device_type: training on CPU vs GPU
+    :param categorical_features: list of categorical features
+    :param early_stopping_rounds: # of rounds to stop training if no increase in model performance
+    :param class_weights: for imbalanced data sets -
+    :return: A tuned LightGBM Classifier.
     """
 
     start_time = datetime.now()
@@ -120,7 +95,8 @@ def lgb_tuning(x_train, y_train, x_test, y_test,
 
         lgbm = lgb.LGBMClassifier(
             learning_rate=space['learning_rate'],
-            #max_depth=int(space['max_depth']),
+            n_estimators=int(space['n_estimators']),
+            max_depth=int(space['max_depth']),
             num_leaves=int(space['num_leaves']),
             colsample_bytree=space['colsample_bytree'],
             feature_fraction=space['feature_fraction'],
@@ -131,8 +107,7 @@ def lgb_tuning(x_train, y_train, x_test, y_test,
             n_jobs=cpu_count,
             device_type=device_type,
             objective='binary',
-            class_weight=class_weights,
-            max_depth=max_depth
+            class_weight=class_weights
         )
 
         lgbm.fit(x_train, y_train,
@@ -142,13 +117,13 @@ def lgb_tuning(x_train, y_train, x_test, y_test,
                  verbose=False
                  )
 
-        # Applying k-Fold Cross Validation
-        strat_k_fold = StratifiedKFold(n_splits=cv_value)
+        # see if you can add stratifiedkfold here
 
+        # Applying k-Fold Cross Validation
         accuracies = cross_val_score(estimator=lgbm,
                                      X=x_train,
                                      y=y_train,
-                                     cv=strat_k_fold,
+                                     cv=cv_value,
                                      n_jobs=cpu_count,
                                      scoring=scoring)
 
@@ -168,7 +143,8 @@ def lgb_tuning(x_train, y_train, x_test, y_test,
 
     space = {
         'learning_rate': hp.loguniform('learning_rate', np.log(0.001), np.log(0.3)),
-        # 'max_depth': hp.quniform('max_depth', 1, 15, 1),
+        'n_estimators': hp.quniform('n_estimators', 50, 1200, 25),
+        'max_depth': hp.quniform('max_depth', 1, 15, 1),
         'num_leaves': hp.quniform('num_leaves', 10, 150, 1),
         'colsample_bytree': hp.uniform('colsample_bytree', 0.3, 1.0),
         'feature_fraction': hp.uniform('feature_fraction', .3, 1.0),
@@ -188,7 +164,8 @@ def lgb_tuning(x_train, y_train, x_test, y_test,
     # Fitting LightGBM to the Training set
     light_gbm = lgb.LGBMClassifier(
         learning_rate=round((lgb_hyperparams['learning_rate']), 3),
-        # max_depth=int(lgb_hyperparams['max_depth']),
+        n_estimators=int(lgb_hyperparams['n_estimators']),
+        max_depth=int(lgb_hyperparams['max_depth']),
         num_leaves=int(lgb_hyperparams['num_leaves']),
         colsample_bytree=lgb_hyperparams['colsample_bytree'],
         feature_fraction=lgb_hyperparams['feature_fraction'],
@@ -199,8 +176,7 @@ def lgb_tuning(x_train, y_train, x_test, y_test,
         categorical_list=lgb_hyperparams['categorical_list'],
         objective='binary',
         device_type=device_type,
-        class_weight=class_weights,
-        max_depth=max_depth
+        class_weight=class_weights
     )
 
     lgb_results = org_results(trials.trials, lgb_hyperparams, 'LightGBM')
@@ -221,11 +197,28 @@ def catboost_tuning(x_train, y_train,
                     cpu_count,
                     scoring,
                     cv_value,
-                    scale_pos_weight,
                     max_evals_num,
                     categorical_features,
                     catboost_eval_metric,
                     task_type):
+
+    """
+    This function performs parameter tuning a CatBoost Classifier.
+
+    :param x_train: training set  data
+    :param y_train: target variable
+    :param x_test: test test data
+    :param y_test: test set target variable
+    :param cpu_count: number of cpu cores to use
+    :param scoring: scoring metric to be used for the tuning
+    :param cv_value: number of cross validations to perform
+    :param max_evals_num: max evaluations for the hyperopt function
+    :param catboost_eval_metric: catboost has specific eval metrics i.e., "F1" equivalent to f1_weighted score
+    :param categorical_features: list of categorical features
+    :param task_type: GPU vs CPU
+    :param early_stopping_rounds: # of rounds to stop training if no increase in model performance
+    :return: A tuned Catboost Classifier.
+    """
 
     start_time = datetime.now()
 
@@ -234,11 +227,9 @@ def catboost_tuning(x_train, y_train,
                                                depth=int(space['depth']),
                                                l2_leaf_reg=space['l2_leaf_reg'],
                                                learning_rate=space['learning_rate'],
-                                               thread_count=-1,
                                                loss_function='Logloss',
                                                eval_metric=catboost_eval_metric,
                                                cat_features=categorical_features,
-                                               scale_pos_weight=scale_pos_weight,
                                                task_type=task_type, od_type='Iter', od_wait=100,
                                                verbose=False
                                                )
@@ -284,9 +275,7 @@ def catboost_tuning(x_train, y_train,
                                                 eval_metric=catboost_eval_metric,
                                                 cat_features=categorical_features,
                                                 task_type=task_type,
-                                                scale_pos_weight=scale_pos_weight,
                                                 od_type='Iter',
-                                                thread_count=-1,
                                                 od_wait=100,
                                                 verbose=False)
 
@@ -304,34 +293,41 @@ def xgboost_parameter_tuning(x_train, y_train,
                              x_test, y_test,
                              cpu_count,
                              scoring,
+                             early_stopping_rounds,
                              cv_value,
-                             scale_pos_weight,
                              max_evals_num,
-                             xgboost_eval_metric='aucpr',
-                             early_stopping_rounds=100,
                              ):
+    """
+    This function performs parameter tuning a XGBoost Classifier.
+
+    :param x_train: training set  data
+    :param y_train: target variable
+    :param x_test: test test data
+    :param y_test: test set target variable
+    :param cpu_count: number of cpu cores to use
+    :param scoring: scoring metric to be used for the tuning
+    :param cv_value: number of cross validations to perform
+    :param max_evals_num: max evaluations for the hyperopt function
+    :param early_stopping_rounds: # of rounds to stop training if no increase in model performance
+    :return: A tuned XGBoost Classifier.
+    """
 
     start_time = datetime.now()
 
-    strat_k_fold = StratifiedKFold(n_splits=cv_value)
-  
     def objective(space):
-        xgb_clf = xgb.XGBClassifier(max_depth=int(space['max_depth']),
+        xgb_clf = xgb.XGBClassifier(n_estimators=space['n_estimators'],
+                                    max_depth=int(space['max_depth']),
                                     learning_rate=space['learning_rate'],
                                     gamma=space['gamma'],
                                     min_child_weight=space['min_child_weight'],
                                     subsample=space['subsample'],
                                     colsample_bytree=space['colsample_bytree'],
                                     n_jobs=cpu_count,
-                                    grow_policy='lossguide',
-                                    scale_pos_weight=scale_pos_weight,
-                                    n_estimators=10000
                                     )
 
         eval_set = [(x_test, y_test)]
         xgb_clf.fit(x_train, y_train,
                     eval_set=eval_set,
-                    eval_metric=xgboost_eval_metric,
                     verbose=False,
                     early_stopping_rounds=early_stopping_rounds)
 
@@ -339,10 +335,9 @@ def xgboost_parameter_tuning(x_train, y_train,
         accuracies = cross_val_score(estimator=xgb_clf,
                                      X=x_train,
                                      y=y_train,
-                                     cv=strat_k_fold,
+                                     cv=cv_value,
                                      n_jobs=cpu_count,
                                      scoring=scoring)
-        
         cross_val_mean = accuracies.mean()
 
         return {'loss': 1 - cross_val_mean, 'status': STATUS_OK}
@@ -350,6 +345,7 @@ def xgboost_parameter_tuning(x_train, y_train,
     space = {
         'max_depth': hp.choice('max_depth', range(5, 30, 1)),
         'learning_rate': hp.quniform('learning_rate', 0.01, 0.5, 0.01),
+        'n_estimators': hp.choice('n_estimators', range(20, 205, 5)),
         'gamma': hp.quniform('gamma', 0, 0.50, 0.01),
         'min_child_weight': hp.quniform('min_child_weight', 1, 10, 1),
         'subsample': hp.quniform('subsample', 0.1, 1, 0.01),
@@ -363,16 +359,14 @@ def xgboost_parameter_tuning(x_train, y_train,
                 max_evals=max_evals_num,
                 trials=trials)
 
-    classifier = xgb.XGBClassifier(scale_pos_weight=scale_pos_weight,
+    classifier = xgb.XGBClassifier(n_estimators=best['n_estimators'],
                                    max_depth=best['max_depth'],
                                    learning_rate=best['learning_rate'],
                                    gamma=best['gamma'],
                                    min_child_weight=best['min_child_weight'],
                                    subsample=best['subsample'],
                                    colsample_bytree=best['colsample_bytree'],
-                                   n_jobs=cpu_count,
-                                   grow_policy='lossguide',
-                                   n_estimators=10000
+                                   n_jobs=cpu_count
                                    )
 
     time_elapsed = datetime.now() - start_time
@@ -389,9 +383,18 @@ def lr_tuning(x_train, y_train,
               max_evals_num,
               cv_value
               ):
+
     """
+    This function tunes a logistic regression classifier
 
-
+    :param x_train: training set data
+    :param y_train: target feature
+    :param cpu_count: # of CPU Scores
+    :param class_weights: class weight value for imbalanced dataset
+    :param scoring: Scoring metric to use
+    :param max_evals_num:
+    :param cv_value: # of cross validation
+    :return: A tuned logistic regression classifier
     """
 
     if not isinstance(x_train, pd.DataFrame):
@@ -452,8 +455,14 @@ def knn_tuning(x_train, y_train,
                cv_value
                ):
     """
-
-
+    This function tunes a k-nearest neighbor classifier
+    :param x_train: training dataset
+    :param y_train: target feature
+    :param cpu_count: # of CPU Cores
+    :param scoring: Scoring metric to be used
+    :param max_evals_num: Maximum number of evaluations for hyperopt
+    :param cv_value: # of cross validation folds
+    :return: A tuned knn classifier
     """
 
     if not isinstance(x_train, pd.DataFrame):
@@ -508,13 +517,15 @@ def rf_tuning(x_train, y_train,
               cpu_count, scoring,
               cv_value, max_evals_num):
     """
-    :param x_train:
-    :param y_train:
-    :param cpu_count:
-    :param scoring:
-    :param cv_value:
-    :param max_evals_num:
-    :return:
+    This function tunes a Random Forest Classifier
+
+    :param x_train: training dataset
+    :param y_train: target feature
+    :param cpu_count: # of CPU Cores
+    :param scoring: Scoring metric to be used
+    :param cv_value: cross validation
+    :param max_evals_num: # of evaluations for hyperopt
+    :return: A tuned Random Forest Classifier
     """
 
     start_time = datetime.now()

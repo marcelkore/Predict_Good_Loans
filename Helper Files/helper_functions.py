@@ -15,6 +15,8 @@ from datetime import datetime
 from yellowbrick.model_selection import LearningCurve
 from sklearn.model_selection import StratifiedKFold
 import itertools
+from sklearn.feature_selection import RFECV
+import catboost as cb
 
 # Viz Libraries
 import seaborn as sns
@@ -30,22 +32,14 @@ from cycler import cycler
 import matplotlib.style as style
 import matplotlib.pyplot as plt
 import boruta_py as bpy
-from matplotlib.ticker import FuncFormatter
-import scikitplot as skplt
+from yellowbrick.classifier import DiscriminationThreshold
 
 
 style.use('fivethirtyeight')
 # %matplotlib inline
 
-# Outlier detection
-from sklearn.covariance import EllipticEnvelope
-
 # metrics
-from sklearn.metrics import accuracy_score, recall_score, precision_score
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.model_selection import KFold
 import numpy as np
-from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix
 from sklearn.metrics import roc_curve
 
 # sklearn libraries
@@ -55,10 +49,6 @@ from sklearn.linear_model import LogisticRegression
 from mlxtend.plotting import plot_sequential_feature_selection as plot_sfs
 from mlxtend.feature_selection import SequentialFeatureSelector as sfs
 
-# Model Interpretation
-import eli5
-from eli5.sklearn import PermutationImportance
-
 # category encoding
 import category_encoders as ce
 
@@ -66,9 +56,7 @@ import category_encoders as ce
 from sklearn.ensemble import RandomForestClassifier
 
 # feature selection
-#from sklearn.feature_selection import RFECV
 from sklearn.model_selection import learning_curve
-
 from sklearn.ensemble import IsolationForest
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -108,7 +96,6 @@ def define_optimal_threshold(model,X_test,y_test,plot=True):
         ax[1].set_xlabel('Threshold');
         ax[1].set_ylabel('True Positive & False Positive Rates');
 
-
     # finding the optimal threshold for the model
     function = tp + (1 - fp)
     index = np.argmax(function)
@@ -117,6 +104,18 @@ def define_optimal_threshold(model,X_test,y_test,plot=True):
     print("optimal threshold:{}".format(optimal_threshold))
     
     return optimal_threshold
+
+
+def plot_optimal_threshold(model, x_train, y_train):
+    """
+
+    """
+
+    # Visualization Threshold
+    visualizer = DiscriminationThreshold(model)
+
+    visualizer.fit(x_train, y_train)  # Fit the data to the visualizer
+    visualizer.show();
         
 
 def plot_predicted_probabilities(probabilities):
@@ -256,7 +255,7 @@ def encode_categorical_features(dataframe, strategy, list_of_features,list_of_fe
     return dataframe
 
 
-def rfecv_feature_selection(x_train, y_train, scoring, n_jobs, cross_val,cross_val_count,classifier='rfc', top_n_features= 15,):
+def rfecv_feature_selection(df, target_feature, scoring, n_jobs, cross_val_count):
     """
     This function will take a dataframe as input and perform the following:
 
@@ -264,30 +263,34 @@ def rfecv_feature_selection(x_train, y_train, scoring, n_jobs, cross_val,cross_v
     features. We will also make sure to add fico_score and dti features
     if not selected in the final  list of features.
 
-    :param x_train: feature set
-    :param y_train: target feature
+    :param df: pass dataframe name
+    :param target_feature: pass target feature name
     :param scoring: target scoring metric
-    :param cross_val: # of cross validation folds
+    :param cross_val_count: # of cross validation folds
     :param n_jobs: # of cpu jobs
-    :param top_n_features: The number of features to select (filter)
-    :param classifier: Optional parameter to select classifier to use
     :return: dataframe with outliers removed.
     """
 
-    if not isinstance(x_train, pd.DataFrame):
+    if not isinstance(df, pd.DataFrame):
         raise ValueError("Object passed is not a dataframe")
 
-    x = x_train
-    y = y_train
+    # drop our target feature
+    x = df.drop(target_feature, axis=1)
+    # save our target feature in a y variable
+    y = df[target_feature]
 
     feature_names = x.columns
+    import xgboost as xgb
 
-    if classifier == 'rfc':
-        classifier = RandomForestClassifier(n_jobs=-1, class_weight="balanced", max_depth=6, random_state=2019)
-    else:
-        classifier = LogisticRegression(class_weight='balanced', n_jobs=n_jobs, solver='lbfgs')
+    classifier = xgb.XGBClassifier(n_jobs=n_jobs,class_weight="balanced",max_depth=6,random_state=2019)
+    #classifier = RandomForestClassifier(n_jobs=n_jobs,class_weight="balanced",max_depth=6,random_state=2019)
+    cv = StratifiedKFold(n_splits=cross_val_count)
 
-    rfecv_selector = RFECV(estimator=classifier, step=1, cv=cross_val_count, scoring=scoring, n_jobs=n_jobs)
+    rfecv_selector = RFECV(estimator=classifier,
+                           step=1,
+                           cv=cv,
+                           scoring=scoring,
+                           n_jobs=n_jobs)
 
     rfecv_selector.fit(x, y)
 
@@ -297,99 +300,8 @@ def rfecv_feature_selection(x_train, y_train, scoring, n_jobs, cross_val,cross_v
     # grab selected features
     top_n_features = feature_names[rfecv_selector.support_].tolist()
 
-    x = x[top_n_features]
-
-    return x
-
-
-def hybrid_feature_selection(dataframe, target_feature_name, scoring_metric, n_jobs, cross_val, range_of_features):
-    """
-    This function will take a dataframe as input and perform the following:
-
-    a) Remove noise using Boruta Feature Selection
-    b) Select the top features given a range of features to select
-
-    :param dataframe: dataframe with features to select from
-    :param target_feature_name: target name of the feature
-    :param scoring_metric: f1_weighted, accuracy, roc_auc etc.
-    :param cross_val: # of cross validation folds
-    :param n_jobs: # of cpu jobs
-    :param range_of_features: tuple of the range of features to select from (low, high)
-    :return: dataframe with features reduced
-    """
-
-    if not isinstance(dataframe, pd.DataFrame):
-        raise ValueError("Object passed is not a dataframe")
-
-    if not isinstance(range_of_features, tuple):
-        raise ValueError("range_of_features passed is not a tuple")
-
-    classifier = RandomForestClassifier(n_jobs=n_jobs, class_weight="balanced", max_depth=6, random_state=2019)
-
-    x_temp = dataframe.drop(target_feature_name, axis=1)
-    column_names = x_temp.columns
-    y_temp = dataframe[target_feature_name]
-
-    x = dataframe.drop(target_feature_name, axis=1).values
-    y = dataframe[target_feature_name].values.ravel()
-
-    """
-    Boruta Py Code - credit: https://www.kaggle.com/rsmits/feature-selection-with-boruta
-    """
-    
-    feat_selector = bpy.BorutaPy(classifier, n_estimators='auto', verbose=False, random_state=1)
-
-    feat_selector.fit(x, y)
-
-    filtered_dataframe = feat_selector.transform(x)
-
-    final_features = list()
-
-    indexes = np.where(feat_selector.support_ == True)
-
-    for x in np.nditer(indexes):
-        final_features.append(column_names[x])
-
-    boruta_dataframe = x_temp[final_features]
-
-    # merge back the target variable to the dataframe(df)
-    df = boruta_dataframe.merge(y_temp, on=y_temp.index)
-
-    # drop generated index
-    df.drop("key_0", axis=1, inplace=True)
-
-    # Sequential Feature Selection - Select top features given a range
-
-    x = dataframe.drop(target_feature_name, axis=1)
-    # save our target feature in a y variable
-    y = dataframe[target_feature_name]
-
-    # forward selection
-
-    sequential_forward_feature_selection = sfs(classifier,
-                                               k_features=range_of_features,
-                                               forward=True,
-                                               n_jobs=n_jobs,
-                                               floating=False,
-                                               verbose=False,
-                                               scoring=scoring_metric,
-                                               cv=cross_val)
-
-    sfs_algo = sequential_forward_feature_selection.fit(x, y)
-
-    sfs_cross_val_score = sfs_algo.k_score_
-
-    cross_val = round(sfs_cross_val_score, 2)
-
-    selected_features = list(sfs_algo.k_feature_names_)
-
-    print("Number of features selected is:  {}".format(len(sfs_algo.k_feature_names_)))
-
-    print("Cross Validation Score for {}, is {}".format(scoring_metric, cross_val))
-
-    plot_sfs(sfs_algo.get_metric_dict(), kind='std_err', figsize=(11, 7));
-
-    df = x[selected_features]
+    df = x[top_n_features]
+    df = df.iloc[:, 0:25]
 
     # merge back the target variable to the dataframe(df)
     df = df.merge(y, on=y.index)
@@ -397,15 +309,14 @@ def hybrid_feature_selection(dataframe, target_feature_name, scoring_metric, n_j
     # drop generated index
     df.drop("key_0", axis=1, inplace=True)
 
-    cat_features = []
+    plt.figure(figsize=(11, 4))
+    plt.title('Recursive Feature Elimination with Cross-Validation', fontsize=18, fontweight='bold', pad=20)
+    plt.xlabel('Number of features selected', fontsize=14, labelpad=20)
+    plt.ylabel('% Correct Classification', fontsize=14, labelpad=20)
+    plt.plot(range(1, len(rfecv_selector.grid_scores_) + 1), rfecv_selector.grid_scores_, color='#303F9F',
+             linewidth=3)
 
-    for col_name in df.columns:
-        if df[col_name].dtype != 'float64':
-            if col_name != 'loan_status':
-                cat_features.append(col_name)
-
-    print("Categorical Features: {}".format(cat_features))
-
+    plt.show()
     return df
 
 
@@ -431,7 +342,9 @@ def feature_selection_mlextend(dataframe, target_feature_name, scoring_metric, n
     if not isinstance(range_of_features, tuple):
         raise ValueError("range_of_features passed is not a tuple")
 
-    classifier = RandomForestClassifier(n_jobs=n_jobs, class_weight="balanced", max_depth=6, random_state=2019)
+    import lightgbm as lgb
+
+    classifier = lgb.LGBMClassifier(n_jobs=n_jobs, class_weight="balanced", max_depth=6, random_state=2019)
 
     x = dataframe.drop(target_feature_name, axis=1).values
     y = dataframe[target_feature_name].values.ravel()
@@ -477,6 +390,68 @@ def feature_selection_mlextend(dataframe, target_feature_name, scoring_metric, n
                 cat_features.append(col_name)
 
     print(cat_features)
+
+    return df
+
+
+def boruta_feature_selection(dataframe, target_feature_name, n_jobs):
+    """
+    This function will take a dataframe as input and perform the following:
+
+    a) Remove noise using Boruta Feature Selection
+    b) Select the top features given a range of features to select
+
+    :param dataframe: dataframe with features to select from
+    :param target_feature_name: target name of the feature
+    :param n_jobs: # of cpu jobs
+    :return: dataframe with features reduced
+    """
+
+    if not isinstance(dataframe, pd.DataFrame):
+        raise ValueError("Object passed is not a dataframe")
+
+    classifier = RandomForestClassifier(n_jobs=n_jobs, class_weight="balanced", max_depth=6, random_state=2019)
+
+    x_temp = dataframe.drop(target_feature_name, axis=1)
+    column_names = x_temp.columns
+    y_temp = dataframe[target_feature_name]
+
+    x = dataframe.drop(target_feature_name, axis=1).values
+    y = dataframe[target_feature_name].values.ravel()
+
+    """
+    Boruta Py Code - credit: https://www.kaggle.com/rsmits/feature-selection-with-boruta
+    """
+
+    feat_selector = bpy.BorutaPy(classifier, n_estimators='auto', verbose=False, random_state=1)
+
+    feat_selector.fit(x, y)
+
+    filtered_dataframe = feat_selector.transform(x)
+
+    final_features = list()
+
+    indexes = np.where(feat_selector.support_ == True)
+
+    for x in np.nditer(indexes):
+        final_features.append(column_names[x])
+
+    boruta_dataframe = x_temp[final_features]
+
+    # merge back the target variable to the dataframe(df)
+    df = boruta_dataframe.merge(y_temp, on=y_temp.index)
+
+    # drop generated index
+    df.drop("key_0", axis=1, inplace=True)
+
+    cat_features = []
+
+    for col_name in df.columns:
+        if df[col_name].dtype != 'float64':
+            if col_name != 'loan_status':
+                cat_features.append(col_name)
+
+    print("Categorical Features: {}".format(cat_features))
 
     return df
 
@@ -670,7 +645,7 @@ def drop_features_with_missing_values(dataframe, threshold_value=80):
 
     if method == 'threshold':
         # this first step transforms any present inf features to nan values
-        dataframe = dataframe.replace([np.inf, -np.inf], np.nan)
+        # dataframe = dataframe.replace([np.inf, -np.inf], np.nan)
         # calculate the % missing in each column
         missing_values = (dataframe.isnull().sum() / dataframe.shape[0]) * 100
         # sort with highest values at the top
